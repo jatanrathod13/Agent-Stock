@@ -1,0 +1,6 @@
+streamlit==1.32.0  # Core Streamlit library
+pandas==2.2.1      # Data manipulation for displaying metrics
+plotly==5.20.0     # Interactive candlestick charts
+yfinance==0.2.37   # Fetching historical stock data for charts
+reportlab==4.2.0   # PDF generation
+requests==2.32.3   # HTTP requests to FastAPI backend

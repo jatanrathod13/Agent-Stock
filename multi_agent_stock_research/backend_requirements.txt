@@ -1,0 +1,14 @@
+fastapi==0.110.0   # FastAPI framework
+uvicorn==0.29.0    # ASGI server for FastAPI
+openai==1.14.2     # OpenAI API for GPT-4 Turbo
+sentence-transformers==2.6.1  # Embeddings for context memory
+faiss-cpu==1.8.0   # FAISS for vector similarity (CPU version)
+python-dotenv==1.0.1  # Load environment variables
+pandas==2.2.1      # Data manipulation
+yfinance==0.2.37   # Stock data fetching
+pandas-datareader==0.10.0  # Economic data from FRED
+stockstats==0.6.2  # Technical indicators
+transformers==4.39.1  # FinBERT for sentiment analysis
+torch==2.2.1       # PyTorch for LSTM model
+arch==6.3.0        # GARCH model for risk analysis
+numpy==1.26.4      # Numerical computations
