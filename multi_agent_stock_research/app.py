@@ -1,358 +1,277 @@
-import os
-import json
-from queue import Queue
-from datetime import datetime, timedelta
-import numpy as np
+import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 import yfinance as yf
-import openai
-from sentence_transformers import SentenceTransformer
-import faiss
-from fastapi import FastAPI
-import uvicorn
-import logging
-from transformers import BertTokenizer, BertForSequenceClassification
-import torch
+from stock_analysis import analyze
+import traceback
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from datetime import datetime
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Streamlit app configuration
+st.set_page_config(page_title="Stock Analysis Dashboard", layout="wide")
 
-# Initialize OpenAI client
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable not set")
-client = openai.OpenAI(api_key=api_key)
+# Title and description
+st.title("Stock Analysis Dashboard")
+st.markdown("Enter a stock symbol to analyze its market data, fundamentals, technicals, sentiment, and risk profile.")
 
-# Initialize embedder and FAISS index for context memory
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-dim = 384
-index = faiss.IndexFlatL2(dim)
+# Input section in sidebar
+with st.sidebar:
+    st.header("Input")
+    stock_symbol = st.text_input("Stock Symbol (e.g., MSFT, TSLA)", value="MSFT").upper()
+    analyze_button = st.button("Analyze")
 
-# Context memory functions
-def store_context(message):
-    vector = embedder.encode([message])
-    index.add(np.array(vector, dtype=np.float32))
+# Function to generate the PDF report
+def generate_pdf_report(result):
+    """
+    Generate a PDF report from the stock analysis results.
+    
+    Args:
+        result (dict): The analysis result containing stock data and agent outputs.
+    
+    Returns:
+        bytes: The PDF content as a byte string.
+    """
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
 
-def retrieve_context(query, k=3):
-    query_vector = embedder.encode([query])
-    distances, indices = index.search(np.array(query_vector, dtype=np.float32), k)
-    return indices
+    # Title
+    story.append(Paragraph(f"Stock Analysis Report for {result['stock']}", styles['Title']))
+    story.append(Spacer(1, 12))
 
-def save_context_to_file(data, filename="context.json"):
-    with open(filename, "w") as file:
-        json.dump(data, file)
+    # Recommendation
+    story.append(Paragraph("Recommendation", styles['Heading2']))
+    story.append(Paragraph(result['report'], styles['BodyText']))
+    story.append(Spacer(1, 12))
 
-def load_context_from_file(filename="context.json"):
-    try:
-        with open(filename, "r") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        return {}
-
-# Message passing with Queue
-message_queue = Queue()
-
-def send_message(agent_name, message):
-    if isinstance(message, (pd.Series, pd.DataFrame)):
-        message = message.to_dict()
-    elif isinstance(message, dict):
-        message = {k: float(v) if isinstance(v, (np.floating, np.integer)) else v for k, v in message.items()}
-    logger.info(f"Sending message from {agent_name}: {message}")
-    message_queue.put({"agent": agent_name, "message": message})
-    try:
-        store_context(f"{agent_name}: {json.dumps(message)}")
-    except TypeError as e:
-        logger.error(f"Serialization error for {agent_name}: {e}")
-
-def receive_message():
-    msg = message_queue.get() if not message_queue.empty() else None
-    if msg:
-        logger.info(f"Received message: {msg}")
+    # AI Researcher Report
+    story.append(Paragraph("AI Researcher Report", styles['Heading2']))
+    if 'AIResearcher' in result['agent_outputs']:
+        story.append(Paragraph(result['agent_outputs']['AIResearcher']['summary'], styles['BodyText']))
     else:
-        logger.warning("Queue is empty when receiving message")
-    return msg
+        story.append(Paragraph("AI Researcher report unavailable.", styles['BodyText']))
+    story.append(Spacer(1, 12))
 
-# Helper function for beta calculation
-def calculate_beta(stock_symbol):
-    try:
-        end = datetime.now()
-        start = end - timedelta(days=365)
-        stock_data = yf.download(stock_symbol, start=start, end=end, auto_adjust=False)['Adj Close']
-        market_data = yf.download('^GSPC', start=start, end=end, auto_adjust=False)['Adj Close']
-        common_dates = stock_data.index.intersection(market_data.index)
-        stock_data = stock_data[common_dates]
-        market_data = market_data[common_dates]
-        if len(stock_data) < 20 or len(market_data) < 20:
-            return "N/A"
-        stock_returns = stock_data.pct_change().dropna()
-        market_returns = market_data.pct_change().dropna()
-        if len(stock_returns) < 20 or len(market_returns) < 20:
-            return "N/A"
-        cov = stock_returns.cov(market_returns)
-        var = market_returns.var()
-        if var == 0:
-            return "N/A"
-        beta = cov / var
-        return round(beta, 2)
-    except Exception as e:
-        logger.error(f"Error calculating beta for {stock_symbol}: {str(e)}")
-        return "N/A"
+    # Technical Analysis
+    story.append(Paragraph("Technical Analysis", styles['Heading2']))
+    if 'TechnicalAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['TechnicalAnalyzer']:
+        tech_data = result['agent_outputs']['TechnicalAnalyzer']
+        data = [
+            ["Metric", "Value"],
+            ["50-day SMA", str(tech_data.get('sma50', 'N/A'))],
+            ["200-day SMA", str(tech_data.get('sma200', 'N/A'))],
+            ["RSI", str(tech_data.get('rsi', 'N/A'))],
+            ["Support", str(tech_data.get('support', 'N/A'))],
+            ["Resistance", str(tech_data.get('resistance', 'N/A'))]
+        ]
+        table = Table(data)
+        table.setStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ])
+        story.append(table)
+    else:
+        story.append(Paragraph("Technical analysis unavailable.", styles['BodyText']))
+    story.append(Spacer(1, 12))
 
-# Function to generate GPT-4 response
-def generate_response(prompt):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a financial analyst providing detailed stock analysis."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1000,
-            temperature=0.2
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
+    # Fundamental Analysis
+    story.append(Paragraph("Fundamental Analysis", styles['Heading2']))
+    if 'FundamentalAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['FundamentalAnalyzer']:
+        fund_data = result['agent_outputs']['FundamentalAnalyzer']
+        data = [
+            ["Metric", "Value"],
+            ["P/E Ratio", str(fund_data.get('pe_ratio', 'N/A'))],
+            ["PEG Ratio", str(fund_data.get('peg_ratio', 'N/A'))],
+            ["EPS", str(fund_data.get('eps', 'N/A'))],
+            ["Market Cap", str(fund_data.get('market_cap', 'N/A'))],
+            ["Dividend Yield (%)", str(fund_data.get('dividend_yield', 'N/A'))],
+            ["Debt-to-Equity", str(fund_data.get('debt_to_equity', 'N/A'))],
+            ["Sector", str(fund_data.get('sector', 'N/A'))]
+        ]
+        table = Table(data)
+        table.setStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ])
+        story.append(table)
+    else:
+        story.append(Paragraph("Fundamental analysis unavailable.", styles['BodyText']))
+    story.append(Spacer(1, 12))
 
-# Define Agents
-class DataCollector:
-    def run(self, stock_symbol):
+    # Sentiment Analysis
+    story.append(Paragraph("Sentiment Analysis", styles['Heading2']))
+    if 'SentimentAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['SentimentAnalyzer']:
+        sent_data = result['agent_outputs']['SentimentAnalyzer']
+        data = [
+            ["Metric", "Value"],
+            ["Sentiment", str(sent_data.get('sentiment', 'N/A'))],
+            ["Score", str(sent_data.get('score', 'N/A'))]
+        ]
+        table = Table(data)
+        table.setStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ])
+        story.append(table)
+    else:
+        story.append(Paragraph("Sentiment analysis unavailable.", styles['BodyText']))
+    story.append(Spacer(1, 12))
+
+    # Risk Profile
+    story.append(Paragraph("Risk Profile", styles['Heading2']))
+    if 'RiskAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['RiskAnalyzer']:
+        risk_data = result['agent_outputs']['RiskAnalyzer']
+        data = [
+            ["Metric", "Value"],
+            ["Annualized Volatility", str(risk_data.get('annualized_volatility', 'N/A')) + "%"],
+            ["Beta", str(risk_data.get('beta', 'N/A'))],
+            ["VaR (95%)", str(risk_data.get('var_95', 'N/A')) + "%"]
+        ]
+        table = Table(data)
+        table.setStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ])
+        story.append(table)
+    else:
+        story.append(Paragraph("Risk analysis unavailable.", styles['BodyText']))
+    story.append(Spacer(1, 12))
+
+    # Footer with generation date
+    story.append(Paragraph(f"Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+
+    # Build the PDF
+    doc.build(story)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
+
+# Main content area
+if analyze_button:
+    with st.spinner("Analyzing..."):
         try:
-            stock = yf.Ticker(stock_symbol)
-            history = stock.history(period="1d")
-            price = round(history['Close'].iloc[-1], 2)
-            high = round(history['High'].iloc[-1], 2)
-            low = round(history['Low'].iloc[-1], 2)
-            volume = int(history['Volume'].iloc[-1])
-            send_message("DataCollector", {
-                "current_price": price,
-                "high": high,
-                "low": low,
-                "volume": volume
-            })
+            result = analyze(stock_symbol)
+            pdf = generate_pdf_report(result)  # Generate the PDF report
+
+            st.header(f"Analysis for {result['stock']}")
+            st.subheader("Recommendation")
+            st.write(result['report'])
+
+            # Add the download button right after the recommendation
+            st.download_button(
+                label="Download PDF Report",
+                data=pdf,
+                file_name=f"{stock_symbol}_analysis.pdf",
+                mime="application/pdf"
+            )
+
+            # Tabs for organized detailed analysis (unchanged)
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Technicals", "Fundamentals", "Sentiment", "Risk"])
+
+            with tab1:
+                st.markdown("### AI Researcher Report")
+                if 'AIResearcher' in result['agent_outputs']:
+                    st.markdown(result['agent_outputs']['AIResearcher']['summary'])
+                else:
+                    st.write("AI Researcher report unavailable.")
+
+            with tab2:
+                st.subheader("Historical Price Chart")
+                try:
+                    history = yf.Ticker(stock_symbol).history(period="1y")
+                    fig = go.Figure(data=[go.Candlestick(x=history.index,
+                                                         open=history['Open'],
+                                                         high=history['High'],
+                                                         low=history['Low'],
+                                                         close=history['Close'])])
+                    fig.update_layout(title="1-Year Historical Price", xaxis_title="Date", yaxis_title="Price (USD)")
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    st.write("Unable to fetch historical data.")
+
+                st.subheader("Technical Indicators")
+                if 'TechnicalAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['TechnicalAnalyzer']:
+                    tech_data = result['agent_outputs']['TechnicalAnalyzer']
+                    st.write(f"**50-day SMA**: {tech_data.get('sma50', 'N/A')}")
+                    st.write(f"**200-day SMA**: {tech_data.get('sma200', 'N/A')}")
+                    st.write(f"**RSI**: {tech_data.get('rsi', 'N/A')}")
+                    st.write(f"**Support**: {tech_data.get('support', 'N/A')}")
+                    st.write(f"**Resistance**: {tech_data.get('resistance', 'N/A')}")
+                else:
+                    st.write("Technical analysis unavailable due to an error:", result['agent_outputs'].get('TechnicalAnalyzer', {}).get('error', 'Unknown error'))
+
+            with tab3:
+                st.subheader("Fundamental Metrics")
+                if 'FundamentalAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['FundamentalAnalyzer']:
+                    fund_data = result['agent_outputs']['FundamentalAnalyzer']
+                    metrics = {
+                        "P/E Ratio": fund_data.get('pe_ratio', 'N/A'),
+                        "PEG Ratio": fund_data.get('peg_ratio', 'N/A'),
+                        "EPS": fund_data.get('eps', 'N/A'),
+                        "Market Cap": fund_data.get('market_cap', 'N/A'),
+                        "Dividend Yield (%)": fund_data.get('dividend_yield', 'N/A'),
+                        "Debt-to-Equity": fund_data.get('debt_to_equity', 'N/A'),
+                        "Sector": fund_data.get('sector', 'N/A')
+                    }
+                    st.table(pd.DataFrame(metrics.items(), columns=["Metric", "Value"]))
+                else:
+                    st.write("Fundamental analysis unavailable due to an error:", result['agent_outputs'].get('FundamentalAnalyzer', {}).get('error', 'Unknown error'))
+
+            with tab4:
+                st.subheader("Sentiment Analysis")
+                if 'SentimentAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['SentimentAnalyzer']:
+                    sent_data = result['agent_outputs']['SentimentAnalyzer']
+                    st.write(f"**Sentiment**: {sent_data.get('sentiment', 'N/A')} (Score: {sent_data.get('score', 'N/A')})")
+                else:
+                    st.write("Sentiment analysis unavailable due to an error:", result['agent_outputs'].get('SentimentAnalyzer', {}).get('error', 'Unknown error'))
+
+            with tab5:
+                st.subheader("Risk Profile")
+                if 'RiskAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['RiskAnalyzer']:
+                    risk_data = result['agent_outputs']['RiskAnalyzer']
+                    st.write(f"**Annualized Volatility**: {risk_data.get('annualized_volatility', 'N/A')}%")
+                    st.write(f"**Beta**: {risk_data.get('beta', 'N/A')}")
+                    st.write(f"**VaR (95%)**: {risk_data.get('var_95', 'N/A')}%")
+                    summary = result['agent_outputs'].get('AIResearcher', {}).get('summary', '').lower()
+                    risk_level = "N/A"
+                    if "risk profile is low" in summary:
+                        risk_level = "Low"
+                    elif "risk profile is moderate" in summary:
+                        risk_level = "Moderate"
+                    elif "risk profile is high" in summary:
+                        risk_level = "High"
+                    st.write(f"**Risk Level**: {risk_level}")
+                else:
+                    st.write("Risk analysis unavailable due to an error:", result['agent_outputs'].get('RiskAnalyzer', {}).get('error', 'Unknown error'))
+
         except Exception as e:
-            send_message("DataCollector", {"error": str(e)})
+            st.error(f"Error during analysis: {traceback.format_exc()}")
 
-class FundamentalAnalyzer:
-    def run(self, stock_symbol):
-        try:
-            stock = yf.Ticker(stock_symbol)
-            info = stock.info
-            pe_ratio = info.get("trailingPE", "N/A")
-            if isinstance(pe_ratio, (int, float)):
-                pe_ratio = round(pe_ratio, 2)
-            eps = info.get("trailingEps", "N/A")
-            if isinstance(eps, (int, float)):
-                eps = round(eps, 2)
-            market_cap = info.get("marketCap", "N/A")
-            dividend_yield = info.get("dividendYield", "N/A")
-            if isinstance(dividend_yield, (int, float)):
-                dividend_yield = round(dividend_yield * 100, 2)  # Convert to percentage
-            send_message("FundamentalAnalyzer", {
-                "pe_ratio": pe_ratio,
-                "eps": eps,
-                "market_cap": market_cap,
-                "dividend_yield": dividend_yield
-            })
-        except Exception as e:
-            send_message("FundamentalAnalyzer", {"error": str(e)})
-
-class TechnicalAnalyzer:
-    def run(self, stock_symbol):
-        try:
-            stock = yf.Ticker(stock_symbol)
-            history = stock.history(period="200d")
-            sma50 = round(history['Close'].iloc[-50:].mean(), 2)
-            sma200 = round(history['Close'].iloc[-200:].mean(), 2)
-            send_message("TechnicalAnalyzer", {
-                "sma50": sma50,
-                "sma200": sma200
-            })
-        except Exception as e:
-            send_message("TechnicalAnalyzer", {"error": str(e)})
-
-class SentimentAnalyzer:
-    def __init__(self):
-        self.tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')
-        self.model = BertForSequenceClassification.from_pretrained('yiyanghkust/finbert-tone')
-
-    def run(self, stock_symbol):
-        try:
-            stock = yf.Ticker(stock_symbol)
-            news = stock.news
-            if news:
-                sentiments = []
-                for item in news:
-                    title = item.get('title', '')
-                    inputs = self.tokenizer(title, return_tensors="pt", truncation=True, max_length=512)
-                    with torch.no_grad():
-                        outputs = self.model(**inputs)
-                    probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                    sentiment = torch.argmax(probs, dim=-1).item()  # 0: Neutral, 1: Positive, 2: Negative
-                    sentiments.append(sentiment - 1)  # Convert to -1 (Negative), 0 (Neutral), 1 (Positive)
-                avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0
-                sentiment_label = "Positive" if avg_sentiment > 0.5 else "Negative" if avg_sentiment < -0.5 else "Neutral"
-                send_message("SentimentAnalyzer", {"sentiment": sentiment_label, "score": round(avg_sentiment, 2)})
-            else:
-                send_message("SentimentAnalyzer", {"sentiment": "No news available", "score": 0.0})
-        except Exception as e:
-            send_message("SentimentAnalyzer", {"error": str(e)})
-
-class RiskAnalyzer:
-    def run(self, stock_symbol):
-        try:
-            end = datetime.now()
-            start = end - timedelta(days=365)
-            stock_data = yf.download(stock_symbol, start=start, end=end, auto_adjust=False)['Adj Close']
-            if len(stock_data) < 20:
-                raise ValueError("Insufficient data for volatility calculation")
-            stock_returns = stock_data.pct_change().dropna()
-            volatility = round(stock_returns.std(), 4)
-            beta = calculate_beta(stock_symbol)
-            # Placeholder for VaR; requires XGBoost model training
-            var_95 = "N/A"
-            send_message("RiskAnalyzer", {
-                "volatility": volatility,
-                "beta": beta,
-                "var_95": var_95
-            })
-        except Exception as e:
-            send_message("RiskAnalyzer", {"error": str(e)})
-
-class AIResearcher:
-    def run(self, stock_symbol):
-        data = {}
-        while not message_queue.empty():
-            msg = receive_message()
-            if msg:
-                data[msg["agent"]] = msg["message"]
-        
-        if data:
-            prompt = f"""
-You are a senior financial analyst tasked with producing a detailed, actionable stock analysis report for {stock_symbol}. Use the following data, addressing missing values with assumptions or caveats:
-
-**Market Data:**
-- Current Price: ${data.get('DataCollector', {}).get('current_price', 'N/A')}
-- High: ${data.get('DataCollector', {}).get('high', 'N/A')}
-- Low: ${data.get('DataCollector', {}).get('low', 'N/A')}
-- Volume: {data.get('DataCollector', {}).get('volume', 'N/A')}
-
-**Fundamentals:**
-- P/E Ratio: {data.get('FundamentalAnalyzer', {}).get('pe_ratio', 'N/A')} (assume industry avg 15 if N/A)
-- EPS: ${data.get('FundamentalAnalyzer', {}).get('eps', 'N/A')}
-- Market Cap: ${data.get('FundamentalAnalyzer', {}).get('market_cap', 'N/A')}
-- Dividend Yield: {data.get('FundamentalAnalyzer', {}).get('dividend_yield', 'N/A')}%
-
-**Technical Indicators:**
-- 50-day SMA: ${data.get('TechnicalAnalyzer', {}).get('sma50', 'N/A')}
-- 200-day SMA: ${data.get('TechnicalAnalyzer', {}).get('sma200', 'N/A')}
-
-**Sentiment:**
-- Sentiment: {data.get('SentimentAnalyzer', {}).get('sentiment', 'N/A')}
-- Sentiment Score: {data.get('SentimentAnalyzer', {}).get('score', 'N/A')}
-
-**Risk Assessment:**
-- Volatility: {data.get('RiskAnalyzer', {}).get('volatility', 'N/A')}
-- Beta: {data.get('RiskAnalyzer', {}).get('beta', 'N/A')}
-- VaR (95%): {data.get('RiskAnalyzer', {}).get('var_95', 'N/A')}
-
-Generate a report with these sections:
-1. **Executive Summary**: Summarize key findings in 2-3 sentences.
-2. **Valuation**: Compare P/E to industry avg (assume 15 if unknown), assess if over/undervalued, and interpret dividend yield.
-3. **Technical Outlook**: Analyze SMA crossover (50-day vs 200-day).
-4. **Sentiment**: Weigh sentiment score and label; suggest implications for short-term price movement.
-5. **Risk Profile**: Interpret volatility, beta, and VaR; classify risk as Low/Moderate/High.
-6. **Investment Thesis**: Provide a BUY, SELL, or HOLD recommendation with clear reasoning tied to data.
-
-Ensure the report is concise, data-driven, and handles missing data explicitly (e.g., 'P/E unavailable, assuming industry avg of 15'). Avoid speculation beyond the data provided.
-"""
-            summary = generate_response(prompt)
-            send_message("AIResearcher", {"summary": summary})
-        else:
-            send_message("AIResearcher", {"summary": "No data available to summarize."})
-
-class TraderAgent:
-    def run(self, stock_symbol):
-        summary = None
-        while not message_queue.empty():
-            msg = receive_message()
-            if msg and msg["agent"] == "AIResearcher":
-                summary = msg["message"]["summary"]
-        
-        if summary:
-            prompt = f"""
-You are an experienced trader evaluating this stock analysis report for {stock_symbol}:
-
-{summary}
-
-Provide an investment recommendation in this exact format:
-- Recommendation: [BUY/SELL/HOLD]
-- Justification: [2-3 sentences explaining your decision, weighing valuation, technicals, sentiment, and risk]
-
-Base your decision on the report’s data, prioritizing reliable metrics (e.g., P/E, SMA crossover, beta) over uncertain ones (e.g., missing VaR). If data is incomplete, state assumptions and focus on actionable insights for a 3-month horizon.
-"""
-            recommendation = generate_response(prompt)
-            recommendation = recommendation.replace("\n\n", " ").replace("\n", " ").lstrip("- ")
-            send_message("TraderAgent", {"recommendation": recommendation})
-        else:
-            send_message("TraderAgent", {"recommendation": "No data available for recommendation."})
-
-# FastAPI app
-app = FastAPI()
-
-@app.post("/analyze/{stock_symbol}")
-def analyze(stock_symbol: str):
-    global message_queue
-    message_queue = Queue()
-    logger.info(f"Starting analysis for {stock_symbol}")
-    
-    agents = {
-        "DataCollector": DataCollector(),
-        "FundamentalAnalyzer": FundamentalAnalyzer(),
-        "TechnicalAnalyzer": TechnicalAnalyzer(),
-        "SentimentAnalyzer": SentimentAnalyzer(),
-        "RiskAnalyzer": RiskAnalyzer(),
-        "AIResearcher": AIResearcher(),
-        "TraderAgent": TraderAgent()
-    }
-    
-    agent_outputs = {}
-    for agent_name, agent in list(agents.items())[:-2]:  # Run all except AIResearcher and TraderAgent
-        logger.info(f"Running {agent_name}")
-        agent.run(stock_symbol)
-        msg = receive_message()
-        if msg:
-            agent_outputs[agent_name] = msg["message"]
-    
-    # Re-populate queue for AIResearcher
-    for agent_name, output in agent_outputs.items():
-        send_message(agent_name, output)
-    
-    # Run AIResearcher
-    logger.info("Running AIResearcher")
-    agents["AIResearcher"].run(stock_symbol)
-    researcher_msg = receive_message()
-    if researcher_msg:
-        agent_outputs["AIResearcher"] = researcher_msg["message"]
-    
-    # Ensure queue is populated for TraderAgent
-    if "AIResearcher" in agent_outputs:
-        send_message("AIResearcher", agent_outputs["AIResearcher"])
-    
-    # Run TraderAgent
-    logger.info("Running TraderAgent")
-    agents["TraderAgent"].run(stock_symbol)
-    trader_msg = receive_message()
-    if trader_msg:
-        agent_outputs["TraderAgent"] = trader_msg["message"]
-    
-    final_report = agent_outputs.get("TraderAgent", {}).get("recommendation", "Analysis failed.")
-    return {
-        "stock": stock_symbol,
-        "report": final_report,
-        "agent_outputs": agent_outputs
-    }
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8090)
+# Footer
+st.markdown("---")
+st.write("Powered by Streamlit and OpenAI GPT-4 Turbo")
