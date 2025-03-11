@@ -26,30 +26,18 @@ with st.sidebar:
 
 # Function to generate the PDF report
 def generate_pdf_report(result):
-    """
-    Generate a PDF report from the stock analysis results.
-    
-    Args:
-        result (dict): The analysis result containing stock data and agent outputs.
-    
-    Returns:
-        bytes: The PDF content as a byte string.
-    """
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     styles = getSampleStyleSheet()
     story = []
 
-    # Title
     story.append(Paragraph(f"Stock Analysis Report for {result['stock']}", styles['Title']))
     story.append(Spacer(1, 12))
 
-    # Recommendation
     story.append(Paragraph("Recommendation", styles['Heading2']))
     story.append(Paragraph(result['report'], styles['BodyText']))
     story.append(Spacer(1, 12))
 
-    # AI Researcher Report
     story.append(Paragraph("AI Researcher Report", styles['Heading2']))
     if 'AIResearcher' in result['agent_outputs']:
         story.append(Paragraph(result['agent_outputs']['AIResearcher']['summary'], styles['BodyText']))
@@ -57,7 +45,6 @@ def generate_pdf_report(result):
         story.append(Paragraph("AI Researcher report unavailable.", styles['BodyText']))
     story.append(Spacer(1, 12))
 
-    # Technical Analysis
     story.append(Paragraph("Technical Analysis", styles['Heading2']))
     if 'TechnicalAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['TechnicalAnalyzer']:
         tech_data = result['agent_outputs']['TechnicalAnalyzer']
@@ -66,6 +53,10 @@ def generate_pdf_report(result):
             ["50-day SMA", str(tech_data.get('sma50', 'N/A'))],
             ["200-day SMA", str(tech_data.get('sma200', 'N/A'))],
             ["RSI", str(tech_data.get('rsi', 'N/A'))],
+            ["MACD", str(tech_data.get('macd', 'N/A'))],
+            ["Bollinger Middle", str(tech_data.get('boll_mid', 'N/A'))],
+            ["Bollinger Upper", str(tech_data.get('boll_upper', 'N/A'))],
+            ["Bollinger Lower", str(tech_data.get('boll_lower', 'N/A'))],
             ["Support", str(tech_data.get('support', 'N/A'))],
             ["Resistance", str(tech_data.get('resistance', 'N/A'))]
         ]
@@ -84,7 +75,6 @@ def generate_pdf_report(result):
         story.append(Paragraph("Technical analysis unavailable.", styles['BodyText']))
     story.append(Spacer(1, 12))
 
-    # Fundamental Analysis
     story.append(Paragraph("Fundamental Analysis", styles['Heading2']))
     if 'FundamentalAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['FundamentalAnalyzer']:
         fund_data = result['agent_outputs']['FundamentalAnalyzer']
@@ -113,7 +103,6 @@ def generate_pdf_report(result):
         story.append(Paragraph("Fundamental analysis unavailable.", styles['BodyText']))
     story.append(Spacer(1, 12))
 
-    # Sentiment Analysis
     story.append(Paragraph("Sentiment Analysis", styles['Heading2']))
     if 'SentimentAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['SentimentAnalyzer']:
         sent_data = result['agent_outputs']['SentimentAnalyzer']
@@ -137,7 +126,6 @@ def generate_pdf_report(result):
         story.append(Paragraph("Sentiment analysis unavailable.", styles['BodyText']))
     story.append(Spacer(1, 12))
 
-    # Risk Profile
     story.append(Paragraph("Risk Profile", styles['Heading2']))
     if 'RiskAnalyzer' in result['agent_outputs'] and 'error' not in result['agent_outputs']['RiskAnalyzer']:
         risk_data = result['agent_outputs']['RiskAnalyzer']
@@ -145,7 +133,8 @@ def generate_pdf_report(result):
             ["Metric", "Value"],
             ["Annualized Volatility", str(risk_data.get('annualized_volatility', 'N/A')) + "%"],
             ["Beta", str(risk_data.get('beta', 'N/A'))],
-            ["VaR (95%)", str(risk_data.get('var_95', 'N/A')) + "%"]
+            ["VaR (95%)", str(risk_data.get('var_95', 'N/A')) + "%"],
+            ["10-Year Treasury Yield", str(risk_data.get('treasury_yield', 'N/A')) + "%"]
         ]
         table = Table(data)
         table.setStyle([
@@ -162,10 +151,8 @@ def generate_pdf_report(result):
         story.append(Paragraph("Risk analysis unavailable.", styles['BodyText']))
     story.append(Spacer(1, 12))
 
-    # Footer with generation date
     story.append(Paragraph(f"Report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
 
-    # Build the PDF
     doc.build(story)
     pdf = buffer.getvalue()
     buffer.close()
@@ -176,13 +163,12 @@ if analyze_button:
     with st.spinner("Analyzing..."):
         try:
             result = analyze(stock_symbol)
-            pdf = generate_pdf_report(result)  # Generate the PDF report
+            pdf = generate_pdf_report(result)
 
             st.header(f"Analysis for {result['stock']}")
             st.subheader("Recommendation")
             st.write(result['report'])
 
-            # Add the download button right after the recommendation
             st.download_button(
                 label="Download PDF Report",
                 data=pdf,
@@ -190,7 +176,6 @@ if analyze_button:
                 mime="application/pdf"
             )
 
-            # Tabs for organized detailed analysis (unchanged)
             tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Technicals", "Fundamentals", "Sentiment", "Risk"])
 
             with tab1:
@@ -220,6 +205,10 @@ if analyze_button:
                     st.write(f"**50-day SMA**: {tech_data.get('sma50', 'N/A')}")
                     st.write(f"**200-day SMA**: {tech_data.get('sma200', 'N/A')}")
                     st.write(f"**RSI**: {tech_data.get('rsi', 'N/A')}")
+                    st.write(f"**MACD**: {tech_data.get('macd', 'N/A')}")
+                    st.write(f"**Bollinger Middle Band**: {tech_data.get('boll_mid', 'N/A')}")
+                    st.write(f"**Bollinger Upper Band**: {tech_data.get('boll_upper', 'N/A')}")
+                    st.write(f"**Bollinger Lower Band**: {tech_data.get('boll_lower', 'N/A')}")
                     st.write(f"**Support**: {tech_data.get('support', 'N/A')}")
                     st.write(f"**Resistance**: {tech_data.get('resistance', 'N/A')}")
                 else:
@@ -257,6 +246,7 @@ if analyze_button:
                     st.write(f"**Annualized Volatility**: {risk_data.get('annualized_volatility', 'N/A')}%")
                     st.write(f"**Beta**: {risk_data.get('beta', 'N/A')}")
                     st.write(f"**VaR (95%)**: {risk_data.get('var_95', 'N/A')}%")
+                    st.write(f"**10-Year Treasury Yield**: {risk_data.get('treasury_yield', 'N/A')}%")
                     summary = result['agent_outputs'].get('AIResearcher', {}).get('summary', '').lower()
                     risk_level = "N/A"
                     if "risk profile is low" in summary:

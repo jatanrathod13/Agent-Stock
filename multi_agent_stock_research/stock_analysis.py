@@ -9,11 +9,15 @@ import openai
 from sentence_transformers import SentenceTransformer
 import faiss
 import logging
-from transformers import BertTokenizer, BertForSequenceClassification
-import torch
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import traceback
+import pandas_datareader.data as web
+from stockstats import StockDataFrame
+from transformers import pipeline
+import torch
+import torch.nn as nn
+from arch import arch_model
 
 # Suppress TOKENIZERS_PARALLELISM warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -36,6 +40,25 @@ logger.info("Initializing SentenceTransformer and FAISS index")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 DIMENSION = 384
 index = faiss.IndexFlatL2(DIMENSION)
+
+# Initialize FinBERT sentiment pipeline
+sentiment_analyzer = pipeline("sentiment-analysis", model="yiyanghkust/finbert-tone")
+
+# Define LSTM model in PyTorch
+class LSTMPricePredictor(nn.Module):
+    def __init__(self, input_size=1, hidden_size=50, num_layers=2):
+        super(LSTMPricePredictor, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        return out
 
 # Context memory functions
 def store_context(message: str) -> None:
@@ -130,14 +153,6 @@ SECTOR_PE = {
 def get_sector_pe(sector: str) -> float:
     return SECTOR_PE.get(sector, 15)
 
-def calculate_rsi(data: pd.Series, window: int = 14) -> float:
-    delta = data.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi.iloc[-1], 2) if not pd.isna(rsi.iloc[-1]) else 50.0
-
 def generate_response(prompt: str) -> str:
     try:
         response = client.chat.completions.create(
@@ -208,27 +223,67 @@ class TechnicalAnalyzer:
             history = stock.history(period="200d")
             if len(history) < 50:
                 raise ValueError("Insufficient historical data for technical analysis")
-            sma50 = round(history['Close'].iloc[-50:].mean(), 2)
-            sma200 = round(history['Close'].iloc[-200:].mean(), 2)
-            rsi = calculate_rsi(history['Close'])
+            
+            # Static indicators with stockstats
+            stock_df = StockDataFrame.retype(history)
+            sma50 = round(stock_df['close_50_sma'].iloc[-1], 2)
+            sma200 = round(stock_df['close_200_sma'].iloc[-1], 2)
+            rsi = round(stock_df['rsi_14'].iloc[-1], 2)
+            macd = round(stock_df['macd'].iloc[-1], 2)
+            boll_mid = round(stock_df['boll'].iloc[-1], 2)
+            boll_upper = round(stock_df['boll_ub'].iloc[-1], 2)
+            boll_lower = round(stock_df['boll_lb'].iloc[-1], 2)
             support = round(history['Close'].iloc[-200:].min(), 2)
             resistance = round(history['Close'].iloc[-200:].max(), 2)
+            
+            # LSTM price prediction with PyTorch
+            prices = history['Close'].values
+            scaler = lambda x: (x - np.min(x)) / (np.max(x) - np.min(x))  # Simple min-max scaler
+            scaled_prices = scaler(prices)
+            sequence_length = 60
+            X, y = [], []
+            for i in range(sequence_length, len(scaled_prices)):
+                X.append(scaled_prices[i-sequence_length:i])
+                y.append(scaled_prices[i])
+            X, y = np.array(X), np.array(y)
+            if len(X) > 0:
+                X = torch.FloatTensor(X).unsqueeze(-1)  # Shape: [samples, sequence_length, 1]
+                y = torch.FloatTensor(y).unsqueeze(-1)  # Shape: [samples, 1]
+                model = LSTMPricePredictor()
+                optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+                criterion = nn.MSELoss()
+                for _ in range(5):  # Minimal epochs for demo; increase for better results
+                    model.train()
+                    optimizer.zero_grad()
+                    output = model(X)
+                    loss = criterion(output, y)
+                    loss.backward()
+                    optimizer.step()
+                model.eval()
+                with torch.no_grad():
+                    last_sequence = torch.FloatTensor(scaled_prices[-sequence_length:]).unsqueeze(0).unsqueeze(-1)
+                    predicted_price_scaled = model(last_sequence).item()
+                    predicted_price = predicted_price_scaled * (np.max(prices) - np.min(prices)) + np.min(prices)
+            else:
+                predicted_price = "N/A"
+            
             send_message("TechnicalAnalyzer", {
                 "sma50": sma50,
                 "sma200": sma200,
                 "rsi": rsi,
+                "macd": macd,
+                "boll_mid": boll_mid,
+                "boll_upper": boll_upper,
+                "boll_lower": boll_lower,
                 "support": support,
-                "resistance": resistance
+                "resistance": resistance,
+                "predicted_price": round(predicted_price, 2) if isinstance(predicted_price, float) else "N/A"
             })
         except Exception as e:
             logger.error(f"TechnicalAnalyzer error for {stock_symbol}: {traceback.format_exc()}")
             send_message("TechnicalAnalyzer", {"error": str(e)})
 
 class SentimentAnalyzer:
-    def __init__(self):
-        self.tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')
-        self.model = BertForSequenceClassification.from_pretrained('yiyanghkust/finbert-tone')
-
     def run(self, stock_symbol: str) -> None:
         try:
             stock = yf.Ticker(stock_symbol)
@@ -237,14 +292,11 @@ class SentimentAnalyzer:
                 sentiments = []
                 for item in news:
                     title = item.get('title', '')
-                    inputs = self.tokenizer(title, return_tensors="pt", truncation=True, max_length=512)
-                    with torch.no_grad():
-                        outputs = self.model(**inputs)
-                    probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                    sentiment = torch.argmax(probs, dim=-1).item()
-                    sentiments.append(sentiment - 1)
+                    result = sentiment_analyzer(title)[0]
+                    score = 1 if result['label'] == 'Positive' else -1 if result['label'] == 'Negative' else 0
+                    sentiments.append(score)
                 avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0
-                sentiment_label = "Positive" if avg_sentiment > 0.5 else "Negative" if avg_sentiment < -0.5 else "Neutral"
+                sentiment_label = "Positive" if avg_sentiment > 0.1 else "Negative" if avg_sentiment < -0.1 else "Neutral"
                 send_message("SentimentAnalyzer", {"sentiment": sentiment_label, "score": round(avg_sentiment, 2)})
             else:
                 send_message("SentimentAnalyzer", {"sentiment": "No news available", "score": 0.0})
@@ -260,14 +312,23 @@ class RiskAnalyzer:
             stock_data = yf.download(stock_symbol, start=start, end=end, auto_adjust=False)['Adj Close']
             if len(stock_data) < 20:
                 raise ValueError("Insufficient data for volatility calculation")
-            stock_returns = stock_data.pct_change().dropna()
-            volatility = round(float(stock_returns.std() * np.sqrt(252) * 100), 2)
+            stock_returns = stock_data.pct_change().dropna() * 100
+            volatility = round(float(stock_returns.std() * np.sqrt(252)), 2)
             beta = calculate_beta(stock_symbol)
-            var_95 = round(float(np.percentile(stock_returns, 5) * 100), 2)
+            var_95 = round(float(np.percentile(stock_returns, 5)), 2)
+            
+            model = arch_model(stock_returns, vol='Garch', p=1, q=1)
+            garch_fit = model.fit(disp='off')
+            garch_volatility = round(float(garch_fit.conditional_volatility[-1]), 2)
+            
+            treasury_yield = web.DataReader('DGS10', 'fred', start, end).iloc[-1]['DGS10'] if not web.DataReader('DGS10', 'fred', start, end).empty else "N/A"
+            
             send_message("RiskAnalyzer", {
                 "annualized_volatility": volatility,
+                "garch_volatility": garch_volatility,
                 "beta": beta,
-                "var_95": var_95
+                "var_95": var_95,
+                "treasury_yield": treasury_yield
             })
         except Exception as e:
             logger.error(f"RiskAnalyzer error for {stock_symbol}: {traceback.format_exc()}")
@@ -299,8 +360,13 @@ You are a senior financial analyst tasked with producing a detailed, actionable 
 - 50-day SMA: ${agent_data.get('TechnicalAnalyzer', {}).get('sma50', 'N/A')}
 - 200-day SMA: ${agent_data.get('TechnicalAnalyzer', {}).get('sma200', 'N/A')}
 - RSI: {agent_data.get('TechnicalAnalyzer', {}).get('rsi', 'N/A')}
+- MACD: {agent_data.get('TechnicalAnalyzer', {}).get('macd', 'N/A')}
+- Bollinger Middle Band: ${agent_data.get('TechnicalAnalyzer', {}).get('boll_mid', 'N/A')}
+- Bollinger Upper Band: ${agent_data.get('TechnicalAnalyzer', {}).get('boll_upper', 'N/A')}
+- Bollinger Lower Band: ${agent_data.get('TechnicalAnalyzer', {}).get('boll_lower', 'N/A')}
 - Support: ${agent_data.get('TechnicalAnalyzer', {}).get('support', 'N/A')}
 - Resistance: ${agent_data.get('TechnicalAnalyzer', {}).get('resistance', 'N/A')}
+- Predicted Price (Next Day): ${agent_data.get('TechnicalAnalyzer', {}).get('predicted_price', 'N/A')}
 
 **Sentiment:**
 - Sentiment: {agent_data.get('SentimentAnalyzer', {}).get('sentiment', 'N/A')} (source: recent news)
@@ -308,15 +374,17 @@ You are a senior financial analyst tasked with producing a detailed, actionable 
 
 **Risk Assessment:**
 - Annualized Volatility: {agent_data.get('RiskAnalyzer', {}).get('annualized_volatility', 'N/A')}%
+- GARCH Volatility: {agent_data.get('RiskAnalyzer', {}).get('garch_volatility', 'N/A')}%
 - Beta: {agent_data.get('RiskAnalyzer', {}).get('beta', 'N/A')}
 - VaR (95%): {agent_data.get('RiskAnalyzer', {}).get('var_95', 'N/A')}%
+- 10-Year Treasury Yield: {agent_data.get('RiskAnalyzer', {}).get('treasury_yield', 'N/A')}%
 
 Generate a report with:
 1. **Executive Summary**: Summarize findings in 2-3 sentences with a 3-month outlook.
 2. **Valuation**: Compare P/E and PEG to sector peers, assess over/undervaluation.
-3. **Technical Outlook**: Analyze SMA trends, RSI, and key support/resistance levels.
+3. **Technical Outlook**: Analyze SMA trends, RSI, MACD, Bollinger Bands, predicted price, and key support/resistance levels.
 4. **Sentiment**: Interpret sentiment and recent news impact on short-term price.
-5. **Risk Profile**: Discuss annualized volatility, beta, VaR; classify risk level.
+5. **Risk Profile**: Discuss annualized volatility, GARCH volatility, beta, VaR, and economic context (e.g., treasury yield); classify risk level.
 6. **Investment Thesis**: Provide BUY/SELL/HOLD with reasoning and catalysts (e.g., earnings, product launches).
 
 Ensure the report is data-driven, concise, and avoids speculation. Use sector-specific benchmarks and estimate missing data where possible.
@@ -365,22 +433,19 @@ def analyze(stock_symbol: str) -> dict:
         futures = {agent_name: executor.submit(agent.run, stock_symbol) for agent_name, agent in agents.items() if agent_name not in ["AIResearcher", "TraderAgent"]}
         for agent_name, future in futures.items():
             try:
-                future.result()  # Wait for completion
+                future.result()
             except Exception as e:
                 logger.error(f"Agent {agent_name} failed for {stock_symbol}: {traceback.format_exc()}")
                 send_message(agent_name, {"error": str(e)})
 
-    # Collect all messages after agents complete
     agent_outputs.update(collect_all_messages())
     logger.info(f"Agent outputs after collection: {agent_outputs.keys()}")
 
-    # Run AIResearcher with collected data
     agents["AIResearcher"].run(stock_symbol, agent_outputs)
     researcher_msg = receive_message()
     if researcher_msg:
         agent_outputs["AIResearcher"] = researcher_msg["message"]
     
-    # Run TraderAgent with AIResearcher output
     if "AIResearcher" in agent_outputs:
         agents["TraderAgent"].run(stock_symbol, agent_outputs["AIResearcher"])
         trader_msg = receive_message()
